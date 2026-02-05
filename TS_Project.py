@@ -20,13 +20,14 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 # In[2]:
 
 
-INPUT_LEN  = 24
+INPUT_LEN = 24
 OUTPUT_LEN = 1
 UNITS = 64
 LR = 0.0003
 EPOCHS_BASELINE = 10
-EPOCHS_ATTENTION = 20
-BATCH = 32
+EPOCHS_ATTENTION = 15
+BATCH_SIZE = 32
+START_TOKEN = 0.0
 
 
 # In[3]:
@@ -36,10 +37,7 @@ def load_and_preprocess(path):
 
     df = pd.read_csv(path)
 
-    df["Datetime"] = pd.to_datetime(
-        df["Date"] + " " + df["Time"],
-        format="%d/%m/%Y %H:%M:%S"
-    )
+    df["Datetime"] = pd.to_datetime(df["Date"] + " " + df["Time"], format="%d/%m/%Y %H:%M:%S")
 
     df.drop(columns=["Date", "Time"], inplace=True)
     df.set_index("Datetime", inplace=True)
@@ -74,10 +72,7 @@ def create_sequences(data, input_len=24, output_len=1):
 
 def build_baseline(input_shape):
 
-    model = tf.keras.Sequential([
-        LSTM(UNITS, input_shape=input_shape),
-        Dense(1)
-    ])
+    model = tf.keras.Sequential([LSTM(UNITS, input_shape=input_shape), Dense(1)])
 
     model.compile(optimizer="adam", loss="mse")
     return model
@@ -98,9 +93,7 @@ class BahdanauAttention(tf.keras.layers.Layer):
 
         query = tf.expand_dims(query, 1)
 
-        score = self.V(
-            tf.nn.tanh(self.W1(query) + self.W2(values))
-        )
+        score = self.V(tf.nn.tanh(self.W1(query) + self.W2(values)))
 
         attention_weights = tf.nn.softmax(score, axis=1)
 
@@ -117,51 +110,42 @@ def build_attention_model(input_shape):
 
     encoder_inputs = Input(shape=input_shape)
 
-    encoder_outputs, state_h, state_c = LSTM(
-        UNITS,
-        return_sequences=True,
-        return_state=True
-    )(encoder_inputs)
+    encoder_outputs, state_h, state_c = LSTM(UNITS, return_sequences=True, return_state=True)(encoder_inputs)
 
-    # decoder receives last timestep feature
-    decoder_inputs = Input(shape=(1, input_shape[1]))
+    decoder_inputs = Input(shape=(OUTPUT_LEN, 1))
 
-    decoder_outputs, _, _ = LSTM(
-        UNITS,
-        return_sequences=False,
-        return_state=True
-    )(decoder_inputs, initial_state=[state_h, state_c])
+    decoder_outputs, _, _ = LSTM(UNITS, return_sequences=True, return_state=True)(decoder_inputs, initial_state=[state_h, state_c])
 
-    attention_layer = BahdanauAttention(UNITS)
+    attention = BahdanauAttention(UNITS)
 
-    context_vector, attention_weights = attention_layer(
-        decoder_outputs,
-        encoder_outputs
-    )
+    context_vector, attention_weights = attention(decoder_outputs[:, -1, :], encoder_outputs)
 
-    concat = Concatenate(axis=-1)([decoder_outputs, context_vector])
+    concat = Concatenate(axis=-1)([decoder_outputs[:, -1, :], context_vector])
 
     output = Dense(1)(concat)
 
-    model = Model(
-        inputs=[encoder_inputs, decoder_inputs],
-        outputs=[output, attention_weights]
-    )
+    model = Model(inputs=[encoder_inputs, decoder_inputs], outputs=[output, attention_weights])
 
-    model.compile(
-        optimizer=Adam(LR, clipnorm=1.0),
-        loss=["mse", None]
-    )
+    model.compile(optimizer=Adam(LR, clipnorm=1.0), loss=["mse", None])
 
     return model
 
 
-# =========================================================
-# 7️⃣ ROLLING ORIGIN EVALUATION  (FIXED — NO BREAK)
-# =================================
-
-
 # In[8]:
+
+
+def build_decoder_input(y):
+
+    decoder_input = np.zeros((len(y), OUTPUT_LEN, 1))
+    decoder_input[:, 0, 0] = START_TOKEN
+
+    if OUTPUT_LEN > 1:
+        decoder_input[:, 1:, 0] = y[:, :-1]
+
+    return decoder_input
+
+
+# In[9]:
 
 
 def rolling_split(X, y, window=6000, step=2000):
@@ -171,112 +155,70 @@ def rolling_split(X, y, window=6000, step=2000):
         yield X[:end], y[:end], X[end:end+step], y[end:end+step]
 
 
-# In[9]:
-
-
-scaled_data, scaler = load_and_preprocess("Electric_Consumption.csv")
-
-X, y = create_sequences(scaled_data, INPUT_LEN, OUTPUT_LEN)
-
-split = int(0.8 * len(X))
-
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
-
-
 # In[10]:
 
 
-baseline = build_baseline((X.shape[1], X.shape[2]))
+scaled_data, scaler = load_and_preprocess("Electric_Consumption.csv")
+X, y = create_sequences(scaled_data, INPUT_LEN, OUTPUT_LEN)
 
-baseline.fit(
-    X_train, y_train,
-    epochs=EPOCHS_BASELINE,
-    batch_size=BATCH,
-    validation_split=0.1
-)
+baseline_rmse_scores = []
+attention_rmse_scores = []
 
+print("\n===== ROLLING ORIGIN EVALUATION =====")
 
-# In[ ]:
+for i, (X_tr, y_tr, X_val, y_val) in enumerate(rolling_split(X, y)):
 
+    print(f"\n--- Window {i+1} ---")
 
-attention_model = build_attention_model((X.shape[1], X.shape[2]))
+    baseline = build_baseline((X.shape[1], X.shape[2]))
+    baseline.fit(X_tr, y_tr, epochs=EPOCHS_BASELINE, batch_size=BATCH_SIZE, verbose=0)
 
-decoder_train_input = X_train[:, -1:, :]
-decoder_test_input  = X_test[:, -1:, :]
+    baseline_preds = baseline.predict(X_val).flatten()
 
-attention_model.fit(
-    [X_train, decoder_train_input],
-    y_train.reshape(-1,1),
-    epochs=EPOCHS_ATTENTION,
-    batch_size=BATCH,
-    validation_split=0.1
-)
+    baseline_rmse = np.sqrt(mean_squared_error(y_val.flatten(), baseline_preds))
+    attention_model = build_attention_model((X.shape[1], X.shape[2]))
 
+    decoder_train = build_decoder_input(y_tr)
+    decoder_val = build_decoder_input(y_val)
 
-# In[ ]:
+    attention_model.fit([X_tr, decoder_train], y_tr.reshape(-1, 1), epochs=EPOCHS_ATTENTION, batch_size=BATCH_SIZE, verbose=0)
 
+    attention_preds = attention_model.predict([X_val, decoder_val])[0].flatten()
 
-y_pred = attention_model.predict([X_test, decoder_test_input])[0].flatten()
-baseline_preds = baseline.predict(X_test).flatten()
+    attention_rmse = np.sqrt(mean_squared_error(y_val.flatten(), attention_preds))
 
-y_true = y_test.flatten()
+    baseline_rmse_scores.append(baseline_rmse)
+    attention_rmse_scores.append(attention_rmse)
 
-results = []
-
-def evaluate(name, y_true, y_pred):
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    results.append([name, mae, rmse])
-
-evaluate("Attention", y_true, y_pred)
-evaluate("Baseline LSTM", y_true, baseline_preds)
-
-metrics_df = pd.DataFrame(results, columns=["Model","MAE","RMSE"])
-print("\nFINAL COMPARISON TABLE")
-print(metrics_df)
+    print("Baseline RMSE :", baseline_rmse)
+    print("Attention RMSE:", attention_rmse)
 
 
-
-# In[ ]:
-
-
-print("\nRolling Evaluation")
-
-rolling_rmse = []
-
-for X_tr, y_tr, X_val, y_val in rolling_split(X, y):
-
-    preds = attention_model.predict(
-        [X_val, X_val[:,-1:,:]]
-    )[0].flatten()
-
-    rmse = np.sqrt(mean_squared_error(y_val.flatten(), preds))
-    rolling_rmse.append(rmse)
-
-print("Average Rolling RMSE:", np.mean(rolling_rmse))
+# In[12]:
 
 
-# In[ ]:
+results = pd.DataFrame({"Model": ["Baseline LSTM", "Seq2Seq Attention"],
+                        "Average Rolling RMSE": [np.mean(baseline_rmse_scores),
+                                                 np.mean(attention_rmse_scores)]})
+print("\n===== FINAL COMPARISON =====")
+print(results)
 
 
-attention_extractor = Model(
-    inputs=attention_model.inputs,
-    outputs=attention_model.output[1]
-)
-
-weights = attention_extractor.predict(
-    [X_test[:1], decoder_test_input[:1]]
-)
+# In[13]:
 
 
-# In[ ]:
+attention_extractor = Model(inputs=attention_model.inputs, outputs=attention_model.output[1])
+
+weights = attention_extractor.predict([X_val[:1], decoder_val[:1]])
 
 
-plt.figure(figsize=(12,2))
+# In[14]:
+
+
+plt.figure(figsize=(12, 2))
 plt.imshow(weights[0].T, aspect="auto")
 plt.title("Temporal Attention Distribution")
-plt.xlabel("Past 24 Hours")
+plt.xlabel("Past Timesteps")
 plt.yticks([])
 plt.colorbar()
 plt.show()
@@ -284,22 +226,14 @@ plt.show()
 
 print("""
 Interpretation:
-
-1. Attention weights peak near the most recent hours, indicating strong short-term
-   temporal dependency in electricity consumption.
-
-2. Mid-range timesteps still receive moderate weight, suggesting the model captures
-   daily usage patterns rather than only last-hour signals.
-
-3. Earlier timesteps show diminishing influence, consistent with decaying
-   autocorrelation in power consumption data.
-
-This supports the hypothesis that recent consumption history dominates
-short-horizon forecasting while attention selectively integrates useful past signals.
+The attention distribution assigns higher importance to recent timesteps,
+indicating strong short-term temporal dependency in electricity consumption.
+Moderate weights across mid-range timesteps suggest the model also captures
+daily usage patterns, while distant past values show diminishing influence.
 """)
 
 
-# In[ ]:
+# In[16]:
 
 
 plt.figure(figsize=(12,4))
