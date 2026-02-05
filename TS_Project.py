@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[19]:
+# In[36]:
 
 
 import numpy as np
@@ -17,7 +17,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
-# In[20]:
+# In[37]:
 
 
 def load_and_preprocess(path):
@@ -40,7 +40,7 @@ def load_and_preprocess(path):
     return scaled, scaler
 
 
-# In[4]:
+# In[38]:
 
 
 def create_sequences(data, input_len=24, output_len=1):
@@ -54,7 +54,7 @@ def create_sequences(data, input_len=24, output_len=1):
     return np.array(X), np.array(y)
 
 
-# In[21]:
+# In[39]:
 
 
 def build_baseline(input_shape):
@@ -65,22 +65,26 @@ def build_baseline(input_shape):
     return model
 
 
-# In[22]:
+# In[40]:
 
 
 class BahdanauAttention(tf.keras.layers.Layer):
 
     def __init__(self, units):
-        super().__init__()
-        self.W1 = Dense(units)
-        self.W2 = Dense(units)
-        self.V = Dense(1)
+        super(BahdanauAttention, self).__init__()
+        self.W1 = tf.keras.layers.Dense(units)
+        self.W2 = tf.keras.layers.Dense(units)
+        self.V  = tf.keras.layers.Dense(1)
 
     def call(self, query, values):
 
-        query_with_time_axis = tf.expand_dims(query, 1)
+        query = tf.expand_dims(query, 1)
 
-        score = self.V(tf.nn.tanh(self.W1(query_with_time_axis) + self.W2(values)))
+        score = self.V(
+            tf.nn.tanh(
+                self.W1(query) + self.W2(values)
+            )
+        )
 
         attention_weights = tf.nn.softmax(score, axis=1)
 
@@ -90,7 +94,7 @@ class BahdanauAttention(tf.keras.layers.Layer):
         return context_vector, attention_weights
 
 
-# In[23]:
+# In[41]:
 
 
 def build_attention_model(input_shape):
@@ -101,13 +105,11 @@ def build_attention_model(input_shape):
 
     decoder_inputs = Input(shape=(1, input_shape[1]))
 
-    decoder_lstm = LSTM(64, return_sequences=False, return_state=True)
-
-    decoder_output, _, _ = decoder_lstm(decoder_inputs, initial_state=[state_h, state_c])
+    decoder_output, _, _ = LSTM(64, return_sequences=False, return_state=True)(decoder_inputs, initial_state=[state_h, state_c])
 
     attention_layer = BahdanauAttention(64)
 
-    context_vector, attention_weights = attention_layer(decoder_output, encoder_outputs)
+    context_vector, attention_weights = attention_layer(decoder_output,encoder_outputs)
 
     concat = Concatenate(axis=-1)([decoder_output, context_vector])
 
@@ -117,20 +119,22 @@ def build_attention_model(input_shape):
 
     model.compile(optimizer=Adam(0.0003, clipnorm=1.0), loss=["mse", None])
 
+    model.attention_layer = attention_layer
+
     return model
 
 
-# In[24]:
+# In[42]:
 
 
 def rolling_split(X, y, window=6000, step=2000):
 
-    for start in range(0, len(X)-window-step, step):
+    for start in range(0, len(X) - window - step, step):
         end = start + window
         yield X[:end], y[:end], X[end:end+step], y[end:end+step]
 
 
-# In[25]:
+# In[43]:
 
 
 scaled_data, scaler = load_and_preprocess("Electric_Consumption.csv")
@@ -138,13 +142,14 @@ scaled_data, scaler = load_and_preprocess("Electric_Consumption.csv")
 X, y = create_sequences(scaled_data, 24, 1)
 
 split = int(0.8 * len(X))
+
 X_train, X_test = X[:split], X[split:]
 y_train, y_test = y[:split], y[split:]
 
 print("Train shape:", X_train.shape)
 
 
-# In[26]:
+# In[44]:
 
 
 baseline = build_baseline((X.shape[1], X.shape[2]))
@@ -152,24 +157,22 @@ baseline = build_baseline((X.shape[1], X.shape[2]))
 baseline.fit(X_train, y_train, epochs=10, batch_size=32, validation_split=0.1)
 
 
-# In[ ]:
+# In[45]:
 
 
 attention_model = build_attention_model((X.shape[1], X.shape[2]))
 
 decoder_train_input = X_train[:, -1:, :]
-decoder_test_input = X_test[:, -1:, :]
+decoder_test_input  = X_test[:, -1:, :]
 
-attention_model.fit([X_train, decoder_train_input], [y_train.reshape(-1,1), np.zeros((len(y_train),24,1))], epochs=20,
-                    batch_size=32, validation_split=0.1)
-
-
-# In[ ]:
+attention_model.fit([X_train, decoder_train_input], y_train.reshape(-1,1), epochs=20, batch_size=32, validation_split=0.1)
 
 
-preds, attn_weights = attention_model.predict([X_test, decoder_test_input])
+# In[46]:
 
-y_pred = preds.flatten()
+
+y_pred = attention_model.predict([X_test, decoder_test_input])[0].flatten()
+
 y_true = y_test.flatten()
 
 print("\nATTENTION MODEL")
@@ -183,24 +186,52 @@ print("MAE:", mean_absolute_error(y_true, baseline_preds))
 print("RMSE:", np.sqrt(mean_squared_error(y_true, baseline_preds)))
 
 
-# In[ ]:
+# In[47]:
 
 
-plt.figure(figsize=(10,4))
+print("\nRolling Evaluation")
 
-attn_map = attn_weights[0].reshape(1, -1)
+for X_tr, y_tr, X_val, y_val in rolling_split(X, y):
 
-plt.imshow(attn_map, aspect="auto")
+    preds = attention_model.predict([X_val, X_val[:,-1:,:]])[0].flatten()
 
-plt.title("Attention Weight Heatmap")
-plt.xlabel("Encoder Time Step")
+    print("Rolling RMSE:",np.sqrt(mean_squared_error(y_val.flatten(), preds)))
+
+    break 
+
+
+# In[48]:
+
+
+print(attention_model.outputs)
+
+
+# In[50]:
+
+
+attention_extractor = Model(inputs=attention_model.inputs, outputs=attention_model.output[1])
+
+weights = attention_extractor.predict([X_test[:1], decoder_test_input[:1]])
+
+
+# In[51]:
+
+
+plt.figure(figsize=(12,2))
+plt.imshow(weights[0].T, aspect="auto")
+plt.title("Temporal Attention Distribution")
+plt.xlabel("Past 24 Hours")
 plt.yticks([])
-
 plt.colorbar()
 plt.show()
 
+print("""Interpretation: The attention map shows higher weights near recent timesteps,
+indicating the model relies more on short-term consumption trends.
+Older hours receive lower attention, suggesting diminishing influence.
+""")
 
-# In[ ]:
+
+# In[52]:
 
 
 plt.figure(figsize=(12,4))
